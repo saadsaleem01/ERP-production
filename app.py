@@ -14,6 +14,414 @@ import streamlit as st
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# PIPELINE ERROR HANDLING & FALLBACK SYSTEM
+# ============================================================================
+
+class PipelineError:
+    """Represents a single error in the processing pipeline."""
+    def __init__(self, stage: str, error_type: str, message: str, severity: str = "warning"):
+        self.stage = stage  # Where error occurred (upload, parse, validate, etc.)
+        self.error_type = error_type  # Type of error
+        self.message = message  # Human-readable message
+        self.severity = severity  # "warning", "error", "critical"
+        self.recovery = None  # Recovery action taken
+
+    def __repr__(self):
+        return f"PipelineError({self.stage}|{self.error_type}|{self.severity}): {self.message}"
+
+
+class DataFrameValidator:
+    """Validates DataFrame at each pipeline stage with fallbacks."""
+
+    @staticmethod
+    def validate_shape(df: pd.DataFrame, min_rows: int = 1, min_cols: int = 1, stage: str = "unknown") -> tuple[bool, Optional[PipelineError]]:
+        """Check if DataFrame has minimum shape."""
+        if df is None:
+            return False, PipelineError(stage, "null_dataframe", "DataFrame is None", "critical")
+        if not isinstance(df, pd.DataFrame):
+            return False, PipelineError(stage, "type_error", f"Expected DataFrame, got {type(df)}", "critical")
+        if df.empty:
+            return False, PipelineError(stage, "empty_dataframe", "DataFrame is empty (no rows)", "warning")
+        if df.shape[0] < min_rows:
+            return False, PipelineError(stage, "insufficient_rows", f"Expected ≥{min_rows} rows, got {df.shape[0]}", "warning")
+        if df.shape[1] < min_cols:
+            return False, PipelineError(stage, "insufficient_columns", f"Expected ≥{min_cols} columns, got {df.shape[1]}", "warning")
+        return True, None
+
+    @staticmethod
+    def validate_columns(df: pd.DataFrame, required_cols: list[str] = None, stage: str = "unknown") -> tuple[bool, Optional[PipelineError]]:
+        """Check if required columns exist."""
+        if df is None or df.empty:
+            return False, PipelineError(stage, "no_columns_check", "Cannot validate columns on empty DataFrame", "warning")
+        if not required_cols:
+            return True, None
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            return False, PipelineError(stage, "missing_columns", f"Missing columns: {', '.join(missing)}", "warning")
+        return True, None
+
+    @staticmethod
+    def validate_numeric(df: pd.DataFrame, col: str, stage: str = "unknown") -> tuple[bool, Optional[PipelineError]]:
+        """Check if column is numeric."""
+        if col not in df.columns:
+            return False, PipelineError(stage, "column_not_found", f"Column '{col}' not found", "warning")
+        try:
+            numeric_count = pd.to_numeric(df[col], errors="coerce").notna().sum()
+            if numeric_count == 0:
+                return False, PipelineError(stage, "no_numeric_values", f"Column '{col}' has no numeric values", "warning")
+            return True, None
+        except Exception as e:
+            return False, PipelineError(stage, "numeric_conversion_error", f"Cannot convert '{col}' to numeric: {str(e)}", "warning")
+
+    @staticmethod
+    def sanitize_numeric_column(df: pd.DataFrame, col: str, fallback_value: float = 0.0) -> tuple[pd.Series, Optional[PipelineError]]:
+        """Convert column to numeric with fallback."""
+        if col not in df.columns:
+            return pd.Series([fallback_value] * len(df), index=df.index), \
+                   PipelineError("sanitize", "column_missing", f"Column '{col}' missing, using fallback {fallback_value}", "warning")
+        try:
+            result = pd.to_numeric(df[col], errors="coerce").fillna(fallback_value)
+            coerced = (pd.to_numeric(df[col], errors="coerce").isna() & df[col].notna()).sum()
+            if coerced > 0:
+                logger.warning(f"Column '{col}': {coerced} values could not be converted to numeric, using {fallback_value}")
+            return result, None
+        except Exception as e:
+            logger.error(f"Failed to sanitize numeric column '{col}': {str(e)}")
+            return pd.Series([fallback_value] * len(df), index=df.index), \
+                   PipelineError("sanitize", "conversion_failed", f"Column '{col}' conversion failed: {str(e)}", "warning")
+
+    @staticmethod
+    def ensure_column(df: pd.DataFrame, col: str, fallback_value: Any = "Unknown") -> pd.DataFrame:
+        """Ensure column exists, create with fallback if missing."""
+        result = df.copy()
+        if col not in result.columns:
+            result[col] = fallback_value
+            logger.warning(f"Column '{col}' missing, filled with '{fallback_value}'")
+        return result
+
+
+class PipelineStage:
+    """Base class for pipeline stages."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.errors = []
+
+    def log_error(self, error: PipelineError):
+        self.errors.append(error)
+        if error.severity == "critical":
+            logger.critical(str(error))
+        elif error.severity == "error":
+            logger.error(str(error))
+        else:
+            logger.warning(str(error))
+
+    def has_critical_errors(self) -> bool:
+        return any(e.severity == "critical" for e in self.errors)
+
+
+# ============================================================================
+# PIPELINE STAGES
+# ============================================================================
+
+class FileUploadStage(PipelineStage):
+    """Validate uploaded file."""
+
+    def __init__(self):
+        super().__init__("FileUpload")
+
+    def process(self, uploaded_file) -> tuple[Optional[bytes], Optional[str]]:
+        """Extract file bytes and validate."""
+        try:
+            if uploaded_file is None:
+                self.log_error(PipelineError("FileUpload", "null_file", "Uploaded file is None", "critical"))
+                return None, None
+
+            # Check file size
+            file_bytes = uploaded_file.getvalue()
+            if len(file_bytes) == 0:
+                self.log_error(PipelineError("FileUpload", "empty_file", "File is empty (0 bytes)", "critical"))
+                return None, None
+
+            max_size = 500 * 1024 * 1024  # 500 MB
+            if len(file_bytes) > max_size:
+                self.log_error(PipelineError("FileUpload", "file_too_large", f"File exceeds {max_size / 1024 / 1024:.0f} MB limit", "critical"))
+                return None, None
+
+            filename = getattr(uploaded_file, 'name', 'unknown')
+            if not filename:
+                self.log_error(PipelineError("FileUpload", "no_filename", "File has no name", "warning"))
+                filename = "unknown"
+
+            # Validate file extension
+            valid_extensions = ['.xlsx', '.xls', '.csv']
+            ext = '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+            if ext not in valid_extensions:
+                self.log_error(PipelineError("FileUpload", "invalid_extension", f"Invalid extension '{ext}', expected {valid_extensions}", "warning"))
+
+            return file_bytes, filename
+
+        except Exception as e:
+            self.log_error(PipelineError("FileUpload", "unexpected_error", f"Unexpected error: {str(e)}", "critical"))
+            return None, None
+
+
+class FileParsingStage(PipelineStage):
+    """Parse file into DataFrame(s)."""
+
+    def __init__(self):
+        super().__init__("FileParsing")
+
+    def process(self, file_bytes: bytes, filename: str) -> list[tuple[str, pd.DataFrame]]:
+        """Parse file with multiple fallback encodings/engines."""
+        results = []
+
+        try:
+            if filename.lower().endswith('.csv'):
+                results = self._parse_csv(file_bytes, filename)
+            else:
+                results = self._parse_excel(file_bytes, filename)
+
+            if not results:
+                self.log_error(PipelineError("FileParsing", "no_parseable_sheets", "No sheets could be parsed", "error"))
+
+            return results
+
+        except Exception as e:
+            self.log_error(PipelineError("FileParsing", "parsing_failed", f"File parsing failed: {str(e)}", "critical"))
+            return []
+
+    def _parse_csv(self, file_bytes: bytes, filename: str) -> list[tuple[str, pd.DataFrame]]:
+        """Parse CSV with encoding fallbacks."""
+        encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1", "iso-8859-1", "gbk"]
+        separators = [None, ",", ";", "\t"]
+
+        for encoding in encodings:
+            for sep in separators:
+                try:
+                    df = pd.read_csv(io.BytesIO(file_bytes), encoding=encoding, sep=sep, engine="python", on_bad_lines="skip")
+                    if not df.empty and df.shape[1] > 0:
+                        logger.info(f"CSV parsed successfully with encoding={encoding}, sep={sep}")
+                        return [("CSV", df)]
+                except Exception as e:
+                    logger.debug(f"CSV parse failed (encoding={encoding}, sep={sep}): {str(e)}")
+                    continue
+
+        self.log_error(PipelineError("FileParsing", "csv_parse_exhausted", "All CSV encoding combinations failed", "error"))
+        return []
+
+    def _parse_excel(self, file_bytes: bytes, filename: str) -> list[tuple[str, pd.DataFrame]]:
+        """Parse Excel with engine fallbacks."""
+        engines = ['openpyxl', 'xlrd', 'odf']
+        results = []
+
+        for engine in engines:
+            try:
+                xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+                for sheet_name in xls.sheet_names:
+                    try:
+                        df = xls.parse(sheet_name)
+                        if df.empty or df.shape[1] == 0:
+                            logger.debug(f"Sheet '{sheet_name}' is empty, skipping")
+                            continue
+                        results.append((sheet_name, df))
+                    except Exception as e:
+                        self.log_error(PipelineError("FileParsing", "sheet_parse_failed", f"Sheet '{sheet_name}' parse failed: {str(e)}", "warning"))
+                        continue
+
+                if results:
+                    logger.info(f"Excel parsed with engine={engine}, {len(results)} sheets")
+                    return results
+
+            except Exception as e:
+                logger.debug(f"Excel engine {engine} failed: {str(e)}")
+                continue
+
+        self.log_error(PipelineError("FileParsing", "excel_parse_exhausted", "All Excel engines failed", "error"))
+        return []
+
+
+class DataValidationStage(PipelineStage):
+    """Validate and sanitize DataFrame structure."""
+
+    def __init__(self):
+        super().__init__("DataValidation")
+        self.validator = DataFrameValidator()
+
+    def process(self, df: pd.DataFrame, sheet_name: str) -> Optional[pd.DataFrame]:
+        """Validate and sanitize DataFrame."""
+        try:
+            # Check basic shape
+            valid, error = self.validator.validate_shape(df, min_rows=1, min_cols=1, stage=self.name)
+            if not valid:
+                self.log_error(error)
+                return None
+
+            # Remove completely empty rows/columns
+            df = df.dropna(how='all')
+            df = df.dropna(how='all', axis=1)
+
+            if df.empty:
+                self.log_error(PipelineError(self.name, "empty_after_cleanup", "DataFrame empty after removing blank rows/columns", "warning"))
+                return None
+
+            # Sanitize column names
+            try:
+                df.columns = [str(c).strip() for c in df.columns]
+            except Exception as e:
+                self.log_error(PipelineError(self.name, "column_name_error", f"Error sanitizing column names: {str(e)}", "warning"))
+
+            logger.info(f"Validated sheet '{sheet_name}': {df.shape[0]} rows × {df.shape[1]} columns")
+            return df
+
+        except Exception as e:
+            self.log_error(PipelineError(self.name, "validation_error", f"Validation failed: {str(e)}", "error"))
+            return None
+
+
+class NumericSanitizationStage(PipelineStage):
+    """Ensure all numeric columns are properly typed."""
+
+    def __init__(self):
+        super().__init__("NumericSanitization")
+        self.validator = DataFrameValidator()
+
+    def process(self, df: pd.DataFrame, numeric_cols: list[str]) -> Optional[pd.DataFrame]:
+        """Convert specified columns to numeric."""
+        if df is None or df.empty:
+            return df
+
+        try:
+            result = df.copy()
+            for col in numeric_cols:
+                if col in result.columns:
+                    series, error = self.validator.sanitize_numeric_column(result, col, fallback_value=0.0)
+                    if error:
+                        self.log_error(error)
+                    result[col] = series
+
+            return result
+
+        except Exception as e:
+            self.log_error(PipelineError(self.name, "sanitization_error", f"Failed to sanitize numerics: {str(e)}", "error"))
+            return df
+
+
+class AggregationStage(PipelineStage):
+    """Aggregate data safely."""
+
+    def __init__(self):
+        super().__init__("Aggregation")
+
+    def process(self, df: pd.DataFrame, group_col: str, agg_cols: list[str]) -> Optional[pd.DataFrame]:
+        """Aggregate with fallback for errors."""
+        if df is None or df.empty or group_col not in df.columns:
+            self.log_error(PipelineError(self.name, "invalid_input", f"Cannot aggregate: group_col='{group_col}' invalid", "warning"))
+            return df
+
+        try:
+            # Ensure numeric columns
+            for col in agg_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+            agg_dict = {col: "sum" for col in agg_cols if col in df.columns}
+            if not agg_dict:
+                return df
+
+            result = df.groupby(group_col, as_index=False).agg(agg_dict)
+            logger.info(f"Aggregated {len(df)} rows into {len(result)} groups by '{group_col}'")
+            return result
+
+        except Exception as e:
+            self.log_error(PipelineError(self.name, "aggregation_error", f"Aggregation failed: {str(e)}", "warning"))
+            return df
+
+
+# ============================================================================
+# PIPELINE ORCHESTRATOR
+# ============================================================================
+
+class ProcessingPipeline:
+    """Main pipeline orchestrator with fallback logic."""
+
+    def __init__(self):
+        self.stages = []
+        self.all_errors = []
+
+    def add_stage(self, stage: PipelineStage):
+        self.stages.append(stage)
+
+    def process_file(self, uploaded_file) -> dict:
+        """Process a single file through the entire pipeline."""
+        result = {
+            "filename": "unknown",
+            "success": False,
+            "rows": 0,
+            "sheets": 0,
+            "data": pd.DataFrame(),
+            "errors": [],
+            "warnings": []
+        }
+
+        try:
+            # Stage 1: File Upload
+            upload_stage = FileUploadStage()
+            file_bytes, filename = upload_stage.process(uploaded_file)
+            result["filename"] = filename or "unknown"
+            self.all_errors.extend(upload_stage.errors)
+
+            if upload_stage.has_critical_errors():
+                result["errors"] = [str(e) for e in upload_stage.errors]
+                return result
+
+            # Stage 2: File Parsing
+            parse_stage = FileParsingStage()
+            sheet_dfs = parse_stage.process(file_bytes, filename)
+            self.all_errors.extend(parse_stage.errors)
+
+            if not sheet_dfs:
+                result["errors"] = [str(e) for e in parse_stage.errors]
+                return result
+
+            # Process each sheet
+            all_data = []
+            for sheet_name, df in sheet_dfs:
+                # Stage 3: Data Validation
+                validation_stage = DataValidationStage()
+                df = validation_stage.process(df, sheet_name)
+                self.all_errors.extend(validation_stage.errors)
+
+                if df is None:
+                    result["warnings"].append(f"Sheet '{sheet_name}' validation failed, skipped")
+                    continue
+
+                # Stage 4: Numeric Sanitization
+                sanitize_stage = NumericSanitizationStage()
+                df = sanitize_stage.process(df, [C_DEBIT, C_CREDIT, C_AMOUNT])
+                self.all_errors.extend(sanitize_stage.errors)
+
+                all_data.append(df)
+
+            if not all_data:
+                result["errors"].append("No valid sheets after processing")
+                return result
+
+            # Combine all sheets
+            combined_df = pd.concat(all_data, ignore_index=True)
+            result["data"] = combined_df
+            result["rows"] = len(combined_df)
+            result["sheets"] = len(sheet_dfs)
+            result["success"] = True
+
+        except Exception as e:
+            logger.error(f"Pipeline failed for {result['filename']}: {str(e)}")
+            result["errors"].append(f"Pipeline error: {str(e)}")
+
+        return result
+
+
 C_SOURCE = "Source"
 C_DATE = "Date"
 C_PERIOD = "Period"
@@ -112,6 +520,105 @@ _XLSX_ROW_WARN = 200_000
 
 # Merge supplier labels when fuzzy similarity ≥ this (88% = 0.88); debit/credit then sum per merged name.
 FUZZY_SUPPLIER_MERGE_THRESHOLD = 0.95
+
+# Per-company fuzzy matching thresholds (lower = more aggressive merging)
+COMPANY_FUZZY_THRESHOLDS = {
+    "Dürr&Feil": 0.50,  # VERY aggressive merging for high-diversity suppliers
+    "BrasstBau": 0.55,
+    "Hertner": 0.55,
+    "SanitärUnion": 0.55,
+    "Volkert": 0.60,
+    "Müllers": 0.60,
+    "Heil": 0.65,
+    "Schönewolf": 0.65,
+}
+
+
+def _aggressive_supplier_cleanup(df: pd.DataFrame, threshold: float = 0.60) -> pd.DataFrame:
+    """Aggressive cleanup for files with many similar supplier names.
+
+    Uses simpler but faster substring/prefix matching for initial reduction,
+    then applies fuzzy matching to remaining groups.
+    """
+    if df.empty or C_SUPPLIER_NAME not in df.columns:
+        return df
+
+    work = df.copy()
+    suppliers = work[C_SUPPLIER_NAME].fillna("Unknown").astype(str).str.strip()
+
+    # Determine prefix length based on threshold
+    # Lower threshold = shorter prefix = more aggressive grouping
+    if threshold < 0.55:
+        prefix_len = 10  # Ultra-aggressive: group by first 10 chars
+    elif threshold < 0.65:
+        prefix_len = 15  # Aggressive: group by first 15 chars
+    else:
+        prefix_len = 20  # Standard: group by first 20 chars
+
+    # Stage 1: Group by common prefixes
+    suppliers_by_prefix = {}
+    for name in suppliers.unique():
+        prefix = name[:prefix_len].lower()
+        if prefix not in suppliers_by_prefix:
+            suppliers_by_prefix[prefix] = []
+        suppliers_by_prefix[prefix].append(name)
+
+    # Stage 2: Within each prefix group, apply fuzzy matching with LOWER threshold
+    # Use even lower threshold within groups to maximize merging
+    group_threshold = max(0.45, threshold - 0.10)  # Go even lower for group merging
+    mapping = {}
+    for prefix, names in suppliers_by_prefix.items():
+        if len(names) > 1:
+            group_map = _fuzzy_group_names(names, threshold=group_threshold)
+            mapping.update(group_map)
+        else:
+            mapping[names[0]] = names[0]
+
+    # Apply mapping
+    work[C_SUPPLIER_NAME] = suppliers.map(lambda x: mapping.get(x, x))
+
+    before = len(suppliers.unique())
+    after = len(work[C_SUPPLIER_NAME].unique())
+    reduction = before - after
+    reduction_pct = int(reduction/before*100) if before > 0 else 0
+
+    logger.info(f"Aggressive cleanup: {before} → {after} suppliers (-{reduction} duplicates, {reduction_pct}%, prefix_len={prefix_len}, threshold={int(threshold*100)}%)")
+
+    return work
+
+
+def _get_adaptive_fuzzy_threshold(company: str, num_suppliers: int, rows: int) -> float:
+    """Determine fuzzy merge threshold based on company and data characteristics.
+
+    Lower threshold = more aggressive merging (useful for high-diversity supplier lists).
+    Higher threshold = more conservative (useful for clean data).
+    """
+    # Check if company has predefined threshold
+    if company in COMPANY_FUZZY_THRESHOLDS:
+        threshold = COMPANY_FUZZY_THRESHOLDS[company]
+        logger.info(f"Using company-specific fuzzy threshold for '{company}': {int(threshold * 100)}%")
+        return threshold
+
+    # Adaptive threshold based on supplier density
+    if rows > 0 and num_suppliers > 0:
+        supplier_density = num_suppliers / rows
+
+        # If too many unique suppliers per row, lower the threshold AGGRESSIVELY
+        if supplier_density > 0.5:  # More than 50% unique suppliers
+            adaptive = 0.50  # Very aggressive
+            logger.info(f"Very high supplier density ({supplier_density:.1%}): using ultra-aggressive threshold of {int(adaptive * 100)}%")
+            return adaptive
+        elif supplier_density > 0.30:  # 30-50% unique
+            adaptive = 0.55  # Aggressive
+            logger.info(f"High supplier density ({supplier_density:.1%}): using aggressive threshold of {int(adaptive * 100)}%")
+            return adaptive
+        elif supplier_density > 0.15:  # 15-30% unique
+            adaptive = 0.65  # Moderate
+            logger.info(f"Medium supplier density ({supplier_density:.1%}): using moderate threshold of {int(adaptive * 100)}%")
+            return adaptive
+
+    # Default threshold
+    return FUZZY_SUPPLIER_MERGE_THRESHOLD
 
 
 def _load_reference_schema_aliases() -> None:
@@ -1182,6 +1689,141 @@ def _fuzzy_group_names(names: list[str], threshold: float = FUZZY_SUPPLIER_MERGE
     return mapping
 
 
+def _merge_similar_supplier_files(results: list[dict]) -> list[dict]:
+    """Detect and merge supplier data from files with similar supplier names.
+
+    For example, if multiple files contain data for 'Volkert' or 'BrasstBau',
+    merges their supplier records into a single entry with combined amounts.
+    """
+    try:
+        if not results:
+            return results
+
+        # Extract supplier info from each result
+        supplier_files = {}
+        for i, result in enumerate(results):
+            suppliers_df = result.get("suppliers")
+            if suppliers_df is None or (isinstance(suppliers_df, pd.DataFrame) and suppliers_df.empty):
+                continue
+
+            if C_SUPPLIER_NAME not in suppliers_df.columns:
+                continue
+
+            # Get all unique supplier names in this file
+            names = suppliers_df[C_SUPPLIER_NAME].fillna("").astype(str).str.strip().unique()
+            names = [n for n in names if n and n.lower() not in ("unknown", "nan")]
+
+            if names:
+                supplier_files[i] = {"names": names, "result": result}
+
+        if len(supplier_files) < 2:
+            return results
+
+        # Build mapping of similar suppliers across files
+        file_ids = list(supplier_files.keys())
+        merge_groups = {}  # Maps file_id -> canonical supplier name
+        processed = set()
+
+        for i, file_i in enumerate(file_ids):
+            if file_i in processed:
+                continue
+
+            names_i = supplier_files[file_i]["names"]
+            group = [file_i]
+            processed.add(file_i)
+
+            # Find other files with similar suppliers
+            for j in range(i + 1, len(file_ids)):
+                file_j = file_ids[j]
+                if file_j in processed:
+                    continue
+
+                names_j = supplier_files[file_j]["names"]
+
+                # Check if any supplier names are similar
+                for name_i in names_i:
+                    for name_j in names_j:
+                        sim = _name_similarity(name_i, name_j)
+                        if sim >= 0.85:  # 85% similarity threshold
+                            group.append(file_j)
+                            processed.add(file_j)
+                            break
+                    if file_j in processed:
+                        break
+
+            if len(group) > 1:
+                merge_groups[tuple(sorted(group))] = group
+
+        # Merge results for file groups with similar suppliers
+        if not merge_groups:
+            return results
+
+        merged_results = []
+        merged_file_ids = set()
+
+        for file_ids_group in merge_groups.values():
+            # Merge suppliers from all files in this group
+            combined_suppliers = []
+            combined_source = " + ".join([results[fid]["filename"] for fid in file_ids_group])
+
+            for fid in file_ids_group:
+                suppliers_df = results[fid]["suppliers"].copy()
+                if not suppliers_df.empty and C_SUPPLIER_NAME in suppliers_df.columns:
+                    combined_suppliers.append(suppliers_df)
+                merged_file_ids.add(fid)
+
+            if combined_suppliers:
+                try:
+                    # Merge and aggregate by supplier
+                    merged_df = pd.concat(combined_suppliers, ignore_index=True)
+
+                    # Sum amounts by supplier, keep first non-null values for other columns
+                    if C_SUPPLIER_NAME in merged_df.columns and not merged_df.empty:
+                        agg_dict = {}
+                        for col in merged_df.columns:
+                            if col in (C_AMOUNT, C_DEBIT, C_CREDIT):
+                                agg_dict[col] = "sum"
+                            elif col not in (C_SUPPLIER_NAME, C_SUPPLIER_ID):
+                                agg_dict[col] = "first"
+
+                        # Only aggregate if we have aggregation rules
+                        if agg_dict:
+                            try:
+                                merged_df = merged_df.groupby(C_SUPPLIER_NAME, as_index=False).agg(agg_dict)
+                            except Exception as e:
+                                logger.warning(f"Aggregation failed: {str(e)}, using raw merged data")
+                                # Keep original merged_df without aggregation
+
+                    # Create merged result entry
+                    merged_result = results[file_ids_group[0]].copy()
+                    merged_result["suppliers"] = merged_df
+                    merged_result["filename"] = combined_source
+                    merged_results.append(merged_result)
+
+                except Exception as e:
+                    logger.error(f"Failed to merge supplier files: {str(e)}, skipping merge")
+                    # Skip this merge group on error
+
+        # Add non-merged results
+        for i, result in enumerate(results):
+            if i not in merged_file_ids:
+                merged_results.append(result)
+
+        # If something went wrong, return original results
+        if not merged_results:
+            logger.warning("Merge process failed, returning original results")
+            return results
+
+        merged_count = len(merged_file_ids)
+        merged_groups = len(merged_results) if len(merged_results) < len(results) else 0
+        logger.info(f"Merged {merged_count} files with similar suppliers into {merged_groups} groups")
+        return merged_results
+
+    except Exception as e:
+        logger.error(f"Merge process completely failed: {str(e)}, returning original results")
+        return results
+
+
 def _merge_transactions_suppliers(transactions: pd.DataFrame, suppliers: pd.DataFrame) -> pd.DataFrame:
     if suppliers.empty or C_SUPPLIER_ID not in transactions.columns or C_SUPPLIER_ID not in suppliers.columns:
         merged = transactions.copy()
@@ -1222,7 +1864,52 @@ def _extract_company_from_filename(filename: str) -> str:
     return name.replace("_", " ").strip() or filename
 
 
-def process_file(uploaded) -> dict:
+def process_file_with_pipeline(uploaded) -> dict:
+    """Enhanced file processing with pipeline fallback system."""
+    try:
+        pipeline = ProcessingPipeline()
+        result = pipeline.process_file(uploaded)
+
+        # If basic pipeline succeeded, use existing detailed parser
+        if result["success"]:
+            logger.info(f"Pipeline validation passed for {result['filename']}, proceeding to detailed parsing")
+            # Continue with existing process_file_legacy
+            return process_file_legacy(uploaded)
+
+        # Pipeline failed, log and continue with legacy processor as fallback
+        logger.warning(f"Pipeline validation failed for {result['filename']}, using legacy parser as fallback")
+        legacy_result = process_file_legacy(uploaded)
+
+        # Merge pipeline errors into legacy result
+        if legacy_result and "sheet_info" in legacy_result:
+            for err in result["errors"]:
+                legacy_result["sheet_info"].insert(0, {"sheet": "PIPELINE_ERROR", "type": "error", "rows": 0, "cols": 0, "note": err})
+
+        return legacy_result
+
+    except Exception as e:
+        logger.critical(f"Pipeline wrapper failed: {str(e)}, using legacy parser")
+        try:
+            return process_file_legacy(uploaded)
+        except Exception as e2:
+            logger.critical(f"Legacy parser also failed: {str(e2)}")
+            return {
+                "filename": getattr(uploaded, 'name', 'unknown'),
+                "company": "",
+                "transactions": pd.DataFrame(),
+                "suppliers": pd.DataFrame(),
+                "pivots": pd.DataFrame(),
+                "sheet_info": [{
+                    "sheet": "ERROR",
+                    "type": "unreadable",
+                    "rows": 0,
+                    "cols": 0,
+                    "note": f"Critical failure: {str(e)} | Fallback error: {str(e2)}"
+                }]
+            }
+
+
+def process_file_legacy(uploaded) -> dict:
     _load_reference_schema_aliases()
     raw_bytes = uploaded.getvalue()
     filename = uploaded.name
@@ -1553,9 +2240,8 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner=False, max_entries=64)
-def _cached_process_file(upload_name: str, raw_bytes: bytes) -> dict:
-    """Cache by filename + bytes so re-runs (widget interaction) stay fast."""
+def _process_file_no_cache(upload_name: str, raw_bytes: bytes) -> dict:
+    """Process file without caching - fresh processing every time."""
 
     class _Uploaded:
         def __init__(self, name: str, blob: bytes):
@@ -1565,10 +2251,133 @@ def _cached_process_file(upload_name: str, raw_bytes: bytes) -> dict:
         def getvalue(self) -> bytes:
             return self._blob
 
-    return process_file(_Uploaded(upload_name, raw_bytes))
+    return process_file_with_pipeline(_Uploaded(upload_name, raw_bytes))
 
 
 EURO = "\u20ac"
+
+
+# ============================================================================
+# ANALYTICS FALLBACK SYSTEM
+# ============================================================================
+
+class SafeAnalytics:
+    """Render analytics with comprehensive fallback handling."""
+
+    @staticmethod
+    def safe_metric(col, label: str, value: Any, default: str = "N/A"):
+        """Render metric with fallback."""
+        try:
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                col.metric(label, default)
+            elif isinstance(value, (int, float)):
+                if isinstance(value, float):
+                    col.metric(label, f"{value:,.2f}")
+                else:
+                    col.metric(label, f"{value:,}")
+            else:
+                col.metric(label, str(value))
+        except Exception as e:
+            logger.warning(f"Metric render failed for '{label}': {str(e)}")
+            col.metric(label, "ERROR")
+
+    @staticmethod
+    def safe_dataframe(df: pd.DataFrame, title: str = "", **kwargs):
+        """Render DataFrame with validation."""
+        try:
+            if df is None or df.empty:
+                st.info(f"No data available{f' for {title}' if title else ''}")
+                return
+
+            # Ensure all numeric columns are properly typed
+            for col in df.columns:
+                try:
+                    if df[col].dtype == 'object':
+                        # Try to convert to numeric
+                        numeric_col = pd.to_numeric(df[col], errors='ignore')
+                        if numeric_col.dtype != 'object':
+                            df[col] = numeric_col
+                except Exception:
+                    pass
+
+            st.dataframe(df, use_container_width=True, **kwargs)
+
+        except Exception as e:
+            logger.error(f"DataFrame render failed{f' for {title}' if title else ''}: {str(e)}")
+            st.error(f"Failed to render table{f' ({title})' if title else ''}")
+
+    @staticmethod
+    def safe_bar_chart(df: pd.DataFrame, x: str, y: str, title: str = "", **kwargs):
+        """Render bar chart with fallback."""
+        try:
+            if df is None or df.empty or x not in df.columns or y not in df.columns:
+                st.info(f"No data for chart{f': {title}' if title else ''}")
+                return
+
+            # Ensure y is numeric
+            df = df.copy()
+            df[y] = pd.to_numeric(df[y], errors="coerce").fillna(0)
+
+            if (df[y] == 0).all():
+                st.info(f"All values are zero{f' ({title})' if title else ''}")
+                return
+
+            fig = px.bar(df, x=x, y=y, title=title, **kwargs)
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as e:
+            logger.error(f"Bar chart failed{f' ({title})' if title else ''}: {str(e)}")
+            st.warning(f"Chart rendering failed{f' ({title})' if title else ''}")
+
+    @staticmethod
+    def safe_line_chart(df: pd.DataFrame, x: str, y: str, title: str = "", **kwargs):
+        """Render line chart with fallback."""
+        try:
+            if df is None or df.empty or x not in df.columns or y not in df.columns:
+                st.info(f"No data for chart{f': {title}' if title else ''}")
+                return
+
+            df = df.copy()
+            df[y] = pd.to_numeric(df[y], errors="coerce").fillna(0)
+            df = df.sort_values(x)
+
+            if (df[y] == 0).all():
+                st.info(f"All values are zero{f' ({title})' if title else ''}")
+                return
+
+            fig = px.line(df, x=x, y=y, markers=True, title=title, **kwargs)
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as e:
+            logger.error(f"Line chart failed{f' ({title})' if title else ''}: {str(e)}")
+            st.warning(f"Chart rendering failed{f' ({title})' if title else ''}")
+
+    @staticmethod
+    def safe_pie_chart(df: pd.DataFrame, names: str, values: str, title: str = "", **kwargs):
+        """Render pie chart with fallback."""
+        try:
+            if df is None or df.empty or names not in df.columns or values not in df.columns:
+                st.info(f"No data for chart{f': {title}' if title else ''}")
+                return
+
+            df = df.copy()
+            df[values] = pd.to_numeric(df[values], errors="coerce").fillna(0)
+            df = df[df[values] > 0]  # Only positive values
+
+            if df.empty:
+                st.info(f"No positive values{f' ({title})' if title else ''}")
+                return
+
+            fig = px.pie(df, names=names, values=values, title=title, **kwargs)
+            fig.update_traces(textposition="inside", textinfo="percent+label")
+            st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as e:
+            logger.error(f"Pie chart failed{f' ({title})' if title else ''}: {str(e)}")
+            st.warning(f"Chart rendering failed{f' ({title})' if title else ''}")
+
 
 _SESSION_KEYS = (
     "_erp_sig",
@@ -1661,10 +2470,12 @@ def main() -> None:
         blobs = [(f.name, f.getvalue()) for f in uploaded_files]
         results: list[dict] = []
         errors: list[dict] = []
-        progress = st.progress(0, text="Processing files...")
+        logger.info(f"Cache disabled - reprocessing all {len(blobs)} files fresh")
+        progress = st.progress(0, text="Processing files (no cache)...")
         for i, (fname, raw) in enumerate(blobs):
             try:
-                result = _cached_process_file(fname, raw)
+                logger.info(f"Processing file (no cache): {fname}")
+                result = _process_file_no_cache(fname, raw)
                 results.append(result)
                 progress.progress((i + 1) / len(blobs), text=f"✓ Processed {fname}")
             except Exception as e:
@@ -1673,6 +2484,9 @@ def main() -> None:
                 logger.error(f"File processing error: {fname} - {str(e)}")
                 progress.progress((i + 1) / len(blobs), text=f"✗ Failed {fname}")
         progress.empty()
+
+        # Merge results with similar suppliers
+        results = _merge_similar_supplier_files(results)
 
         # Show errors if any
         if errors:
@@ -1755,9 +2569,31 @@ def main() -> None:
                         for x in all_tx[C_SUPPLIER_NAME].dropna().unique().tolist()
                         if str(x).strip().lower() not in ("unknown", "nan", "")
                     ]
-                    if 1 < len(u2) < 2_500 and n_rows_tx < 800_000:
-                        name_map = _fuzzy_group_names(u2, threshold=FUZZY_SUPPLIER_MERGE_THRESHOLD)
+
+                    # Get company name for adaptive threshold
+                    company = results[0].get("company", "") if results else ""
+                    adaptive_threshold = _get_adaptive_fuzzy_threshold(company, len(u2), n_rows_tx)
+
+                    # Determine fuzzy matching limits based on threshold
+                    # Lower thresholds can handle MANY more suppliers
+                    if adaptive_threshold < 0.55:
+                        max_suppliers_for_fuzzy = 100_000  # Ultra-aggressive: up to 100k suppliers
+                    elif adaptive_threshold < 0.65:
+                        max_suppliers_for_fuzzy = 50_000   # Aggressive: up to 50k suppliers
+                    elif adaptive_threshold < 0.75:
+                        max_suppliers_for_fuzzy = 10_000   # Moderate: up to 10k suppliers
+                    else:
+                        max_suppliers_for_fuzzy = 2_500    # Conservative: stick with 2.5k limit
+
+                    if 1 < len(u2) < max_suppliers_for_fuzzy:
+                        # Direct fuzzy matching is possible
+                        logger.info(f"Applying fuzzy matching: {len(u2)} suppliers, threshold={int(adaptive_threshold * 100)}% (company={company})")
+                        name_map = _fuzzy_group_names(u2, threshold=adaptive_threshold)
                         all_tx[C_SUPPLIER_NAME] = _series_apply_name_map(all_tx[C_SUPPLIER_NAME], name_map)
+                    elif len(u2) >= max_suppliers_for_fuzzy:
+                        # For very many suppliers, use aggressive prefix-based cleanup
+                        logger.info(f"Using aggressive prefix cleanup for {len(u2)} suppliers at {int(adaptive_threshold * 100)}% threshold (company={company}, max_limit={max_suppliers_for_fuzzy})")
+                        all_tx = _aggressive_supplier_cleanup(all_tx, threshold=adaptive_threshold)
 
             if not all_suppliers.empty and C_SUPPLIER_ID in all_suppliers.columns:
                 sup_dedup = all_suppliers.copy()
@@ -1819,11 +2655,27 @@ def main() -> None:
         return
 
     nf = len(results)
+    # Calculate adaptive threshold for display
+    company = results[0].get("company", "") if results else ""
+    n_suppliers_distinct = all_tx[C_SUPPLIER_NAME].nunique() if C_SUPPLIER_NAME in all_tx.columns else 0
+    display_threshold = _get_adaptive_fuzzy_threshold(company, n_suppliers_distinct, len(all_tx))
+
     st.success(
         f"Loaded **{len(all_tx):,}** transaction rows from **{nf}** file{'s' if nf != 1 else ''}. "
-        f"Similar supplier names are merged at **{int(FUZZY_SUPPLIER_MERGE_THRESHOLD * 100)}%** match; "
+        f"Similar supplier names are merged at **{int(display_threshold * 100)}%** match; "
         f"amounts sum to **one row per supplier** in the summary below. Use sidebar filters as needed."
     )
+
+    # Show supplier merging summary
+    if company in COMPANY_FUZZY_THRESHOLDS or display_threshold < FUZZY_SUPPLIER_MERGE_THRESHOLD:
+        st.info(
+            f"🔗 **Aggressive Supplier Consolidation**: {n_suppliers_distinct:,} unique suppliers merged using **{int(display_threshold * 100)}% similarity** threshold "
+            f"(company: {company or 'auto-detected'}). "
+            f"This **AGGRESSIVELY combines** similar/duplicate names like:\n"
+            f"  • 'Adolf Würth GmbH', 'Adolf Würth', 'A. Würth Inc' → **one entry**\n"
+            f"  • 'Sanitär Union', 'SanitärUnion', 'Sanitär-Union' → **one entry**\n"
+            f"  • Variations with extra spaces, special chars, case differences → **merged**"
+        )
 
     with st.expander("Uploaded Files Overview", expanded=False):
         for r in results:
@@ -1890,23 +2742,57 @@ def main() -> None:
     for col, vals in extra_filters.items():
         view = view[view[col].isin(vals)]
 
+    # Ensure numeric columns are properly typed
+    if C_DEBIT in view.columns:
+        view[C_DEBIT] = pd.to_numeric(view[C_DEBIT], errors="coerce").fillna(0)
+    if C_CREDIT in view.columns:
+        view[C_CREDIT] = pd.to_numeric(view[C_CREDIT], errors="coerce").fillna(0)
+    if C_AMOUNT in view.columns:
+        view[C_AMOUNT] = pd.to_numeric(view[C_AMOUNT], errors="coerce").fillna(0)
+
     total_debit = view[C_DEBIT].sum() if C_DEBIT in view.columns else 0
     total_credit = view[C_CREDIT].sum() if C_CREDIT in view.columns else 0
     total_net = view[C_AMOUNT].sum() if C_AMOUNT in view.columns else 0
     n_suppliers = view[C_SUPPLIER_NAME].nunique() if C_SUPPLIER_NAME in view.columns else 0
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Debit (Spend)", f"{EURO} {total_debit:,.2f}")
-    k2.metric("Total Credit (Returns)", f"{EURO} {total_credit:,.2f}")
-    k3.metric("Net Amount", f"{EURO} {total_net:,.2f}")
-    k4.metric("Unique Suppliers", f"{n_suppliers:,}")
-    k5.metric("Files / Records", f"{len(uploaded_files)} / {len(view):,}")
+    try:
+        SafeAnalytics.safe_metric(k1, "Total Debit (Spend)", total_debit if total_debit and not pd.isna(total_debit) else 0)
+        k1.metric("Total Debit (Spend)", f"{EURO} {float(total_debit):,.2f}")
+    except Exception as e:
+        logger.error(f"Debit metric failed: {str(e)}")
+        k1.metric("Total Debit (Spend)", "ERROR")
+
+    try:
+        k2.metric("Total Credit (Returns)", f"{EURO} {float(total_credit):,.2f}")
+    except Exception as e:
+        logger.error(f"Credit metric failed: {str(e)}")
+        k2.metric("Total Credit (Returns)", "ERROR")
+
+    try:
+        k3.metric("Net Amount", f"{EURO} {float(total_net):,.2f}")
+    except Exception as e:
+        logger.error(f"Net metric failed: {str(e)}")
+        k3.metric("Net Amount", "ERROR")
+
+    try:
+        k4.metric("Unique Suppliers", f"{int(n_suppliers):,}")
+    except Exception as e:
+        logger.error(f"Suppliers metric failed: {str(e)}")
+        k4.metric("Unique Suppliers", "ERROR")
+
+    try:
+        k5.metric("Files / Records", f"{len(uploaded_files)} / {len(view):,}")
+    except Exception as e:
+        logger.error(f"Files/Records metric failed: {str(e)}")
+        k5.metric("Files / Records", "ERROR")
+
     st.markdown("---")
 
     agg_view = _aggregate_by_supplier(view)
     st.subheader("Supplier summary — one row per supplier")
     st.caption(
-        f"Names that are **≥{int(FUZZY_SUPPLIER_MERGE_THRESHOLD * 100)}%** similar (fuzzy match) are treated as one supplier; "
+        f"Names that are **≥{int(display_threshold * 100)}%** similar (fuzzy match) are treated as one supplier; "
         "**Debit**, **Credit**, and **Amount** are **added** across all matching rows. "
         "Transaction count, months, and sources are combined. Detail lines stay in 'All Individual Transactions'."
     )
@@ -1918,27 +2804,35 @@ def main() -> None:
 
     with col_left:
         st.subheader("Top 20 Suppliers by Spend")
-        if C_SUPPLIER_NAME in spend_view.columns and not spend_view.empty:
-            top_sup = spend_view.groupby(C_SUPPLIER_NAME, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False).head(20)
+        if C_SUPPLIER_NAME in spend_view.columns and C_DEBIT in spend_view.columns and not spend_view.empty:
+            # Ensure numeric debit column
+            temp_spend = spend_view.copy()
+            temp_spend[C_DEBIT] = pd.to_numeric(temp_spend[C_DEBIT], errors="coerce").fillna(0)
+            top_sup = temp_spend[temp_spend[C_DEBIT] > 0].groupby(C_SUPPLIER_NAME, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False).head(20)
             if not top_sup.empty:
                 fig = px.bar(top_sup, x=C_SUPPLIER_NAME, y=C_DEBIT, color=C_DEBIT,
                              color_continuous_scale="Blues", labels={C_DEBIT: f"Spend ({EURO})", C_SUPPLIER_NAME: "Supplier"})
                 fig.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No spend data.")
+                st.info("No spend data (all debit amounts are zero or negative).")
         else:
-            st.info("No spend data.")
+            st.info("No spend data available.")
 
     with col_right:
         st.subheader("Monthly Spend Trend")
         vm = spend_view[spend_view["Month"] != "N/A"] if "Month" in spend_view.columns else pd.DataFrame()
         if not vm.empty and C_DEBIT in vm.columns:
-            monthly = vm.groupby("Month", as_index=False)[C_DEBIT].sum().sort_values("Month")
-            fig = px.line(monthly, x="Month", y=C_DEBIT, markers=True,
-                          labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month"})
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
+            temp_monthly = vm.copy()
+            temp_monthly[C_DEBIT] = pd.to_numeric(temp_monthly[C_DEBIT], errors="coerce").fillna(0)
+            monthly = temp_monthly.groupby("Month", as_index=False)[C_DEBIT].sum().sort_values("Month")
+            if not monthly.empty:
+                fig = px.line(monthly, x="Month", y=C_DEBIT, markers=True,
+                              labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month"})
+                fig.update_layout(xaxis_tickangle=-45)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No monthly data available.")
         else:
             st.info("Date information not available for monthly chart.")
 
