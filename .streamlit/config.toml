@@ -6,7 +6,9 @@ port = 8501
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#4F8BF9"
-backgroundColor = "#0E1117"
-secondaryBackgroundColor = "#262730"
-textColor = "#FAFAFA"
+# Light — teal accent on white / slate panels
+primaryColor = "#0D9488"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#0F172A"
+font = "sans serif"

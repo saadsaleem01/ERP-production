@@ -818,6 +818,25 @@ def _safe_sort_filter_options(values: list[Any]) -> list[Any]:
         return sorted(values, key=lambda x: (type(x).__name__, str(x).casefold()))
 
 
+def _filter_label(v: Any) -> str:
+    """Stable string label for sidebar multiselect options and isin() matching."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    s = str(v).strip()
+    if s.lower() in ("nan", "<na>", "nat", "none"):
+        return ""
+    return s
+
+
+def _contains_substr_ci(series: pd.Series, needle: str) -> pd.Series:
+    """Case-insensitive literal substring; safe for regex metacharacters in user input."""
+    n = (needle or "").strip()
+    if not n:
+        return pd.Series(True, index=series.index)
+    pat = re.escape(n)
+    return series.fillna("").astype(str).str.contains(pat, case=False, na=False, regex=True)
+
+
 def clean_dataframe(df: pd.DataFrame, drop_dup_rows: bool = True) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
     df = df.loc[:, ~df.columns.duplicated()]
@@ -1794,10 +1813,30 @@ def _merge_similar_supplier_files(results: list[dict]) -> list[dict]:
                                 logger.warning(f"Aggregation failed: {str(e)}, using raw merged data")
                                 # Keep original merged_df without aggregation
 
-                    # Create merged result entry
+                    # Create merged result entry — keep ALL transaction/pivot rows from every
+                    # file in the group (supplier merge must not drop other files' line items).
                     merged_result = results[file_ids_group[0]].copy()
                     merged_result["suppliers"] = merged_df
                     merged_result["filename"] = combined_source
+                    tx_parts: list[pd.DataFrame] = []
+                    pv_parts: list[pd.DataFrame] = []
+                    sheet_parts: list[dict] = []
+                    for fid in file_ids_group:
+                        r = results[fid]
+                        tdf = r.get("transactions")
+                        if isinstance(tdf, pd.DataFrame) and not tdf.empty:
+                            tx_parts.append(tdf)
+                        pdf = r.get("pivots")
+                        if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+                            pv_parts.append(pdf)
+                        sheet_parts.extend(r.get("sheet_info") or [])
+                    merged_result["transactions"] = (
+                        pd.concat(tx_parts, ignore_index=True, sort=False) if tx_parts else pd.DataFrame()
+                    )
+                    merged_result["pivots"] = (
+                        pd.concat(pv_parts, ignore_index=True, sort=False) if pv_parts else pd.DataFrame()
+                    )
+                    merged_result["sheet_info"] = sheet_parts
                     merged_results.append(merged_result)
 
                 except Exception as e:
@@ -2256,6 +2295,14 @@ def _process_file_no_cache(upload_name: str, raw_bytes: bytes) -> dict:
 
 EURO = "\u20ac"
 
+# Plotly / UI accents — keep in sync with `.streamlit/config.toml` [theme]
+_THEME_PRIMARY = "#0D9488"
+_THEME_SECONDARY = "#7C3AED"
+_THEME_WARM = "#D97706"
+_CHART_TEMPLATE = "plotly_white"
+_CHART_PAPER = "rgba(255,255,255,0)"
+_CHART_PLOT = "rgba(248,250,252,0.97)"
+
 
 # ============================================================================
 # ANALYTICS FALLBACK SYSTEM
@@ -2441,11 +2488,31 @@ def _show_error_modal(errors: list) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="ERP Procurement Dashboard", layout="wide")
-    st.markdown("""<style>
-    [data-testid="stMetricValue"] { font-size: 1.15rem; }
-    .block-container { padding-top: 1.5rem; }
-    div[data-testid="stExpander"] details summary p { font-weight: 600; }
-    </style>""", unsafe_allow_html=True)
+    st.markdown(
+        f"""<style>
+    :root {{
+        --erp-accent: {_THEME_PRIMARY};
+        --erp-accent-soft: rgba(13, 148, 136, 0.2);
+        --erp-text: #0F172A;
+        --erp-muted: #475569;
+    }}
+    .block-container {{ padding-top: 1.5rem; max-width: 100%; }}
+    h1 {{ color: var(--erp-text); font-weight: 700; letter-spacing: -0.02em; }}
+    [data-testid="stMetricValue"] {{
+        font-size: 1.15rem;
+        color: var(--erp-accent);
+    }}
+    [data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #F8FAFC 0%, #F1F5F9 100%);
+        border-right: 1px solid var(--erp-accent-soft);
+    }}
+    div[data-testid="stExpander"] details summary p {{ font-weight: 600; color: var(--erp-muted); }}
+    div[data-testid="stVerticalBlock"] > div:has([data-testid="stMarkdown"]) a {{
+        color: var(--erp-accent);
+    }}
+    </style>""",
+        unsafe_allow_html=True,
+    )
     st.title("ERP Procurement Dashboard")
 
     with st.sidebar:
@@ -2684,63 +2751,160 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("---")
-        selected_companies = []
-        if C_SOURCE in all_tx.columns:
-            selected_companies = st.multiselect(
-                "Company / File",
-                options=_safe_sort_filter_options(all_tx[C_SOURCE].dropna().unique().tolist()),
-                default=[],
-            )
-        selected_suppliers = []
-        if C_SUPPLIER_NAME in all_tx.columns:
-            supplier_all = sorted(
-                {
-                    str(s).strip()
-                    for s in all_tx[C_SUPPLIER_NAME].dropna().tolist()
-                    if str(s).strip() and str(s).strip().lower() not in ("nan", "unknown")
-                }
-            )
-            if not supplier_all:
-                selected_suppliers = []
-            elif len(supplier_all) > _MAX_SUPPLIER_MULTISELECT:
-                st.caption(
-                    f"{len(supplier_all):,} suppliers — use **Supplier name contains** to narrow "
-                    f"(multiselect shows up to {_MAX_SUPPLIER_MULTISELECT} matches)."
+        st.subheader("Filters")
+
+        # Reset UI state (keeps uploaded data cached, only clears filter widgets).
+        if st.button("Reset filters", use_container_width=True, key="erp_reset_filters"):
+            for k in list(st.session_state.keys()):
+                if k.startswith(("erp_filter_", "erp_supplier_", "erp_ms_", "erp_co_")) or k in ("erp_supplier_search",):
+                    st.session_state.pop(k, None)
+            st.rerun()
+
+        # -------- Sources --------
+        selected_companies: list[str] = []
+        with st.expander("Company / File", expanded=True):
+            if C_SOURCE in all_tx.columns:
+                company_opts = sorted(
+                    {_filter_label(v) for v in all_tx[C_SOURCE].dropna().tolist() if _filter_label(v)},
+                    key=lambda s: (s.casefold(), s),
                 )
-                q = st.text_input("Supplier name contains", value="", key="erp_supplier_search")
-                qlow = q.strip().lower()
-                if qlow:
-                    filtered = [x for x in supplier_all if qlow in x.lower()][: _MAX_SUPPLIER_MULTISELECT]
-                else:
-                    filtered = supplier_all[: _MAX_SUPPLIER_MULTISELECT]
-                selected_suppliers = st.multiselect("Supplier", options=filtered, default=[])
+                selected_companies = st.multiselect(
+                    "Company / File",
+                    options=company_opts,
+                    default=[],
+                    help="Leave empty for all sources. Values match each row's Source after normalizing spaces and types.",
+                    key="erp_filter_company",
+                    label_visibility="collapsed",
+                )
             else:
-                selected_suppliers = st.multiselect("Supplier", options=supplier_all, default=[])
-        month_options = (
-            _safe_sort_filter_options([m for m in all_tx["Month"].dropna().unique().tolist() if m != "N/A"])
-            if "Month" in all_tx.columns
-            else []
-        )
-        selected_months = st.multiselect("Month", options=month_options, default=[])
-        extra_filters: dict[str, list] = {}
-        for col in [c for c in [C_GL_ACCOUNT, C_COST_CENTER, C_CATEGORY] if c in all_tx.columns]:
-            vals = all_tx[col].dropna()
-            vals = vals[vals.astype(str).str.strip() != ""]
-            uv = _safe_sort_filter_options(vals.unique().tolist())
-            if 2 <= len(uv) <= 100:
-                sel = st.multiselect(col, options=uv, default=[])
-                if sel:
-                    extra_filters[col] = sel
+                st.caption("No source column found in uploaded data.")
+
+        # -------- Supplier --------
+        supplier_q = ""
+        selected_suppliers: list[str] = []
+        with st.expander("Supplier", expanded=True):
+            if C_SUPPLIER_NAME in all_tx.columns:
+                supplier_all = sorted(
+                    {
+                        str(s).strip()
+                        for s in all_tx[C_SUPPLIER_NAME].dropna().tolist()
+                        if str(s).strip() and str(s).strip().lower() not in ("nan", "unknown")
+                    },
+                    key=lambda s: (s.casefold(), s),
+                )
+                if supplier_all:
+                    supplier_q = st.text_input(
+                        "Supplier name contains",
+                        value="",
+                        key="erp_supplier_search",
+                        help="Filters dashboard rows immediately (case-insensitive). You do not need to pick from the list below.",
+                    )
+                    qlow = supplier_q.strip().casefold()
+                    narrowed = [x for x in supplier_all if not qlow or qlow in x.casefold()]
+                    if len(narrowed) > _MAX_SUPPLIER_MULTISELECT:
+                        st.caption(
+                            f"Showing **{_MAX_SUPPLIER_MULTISELECT:,}** of **{len(narrowed):,}** matching supplier names. "
+                            "Refine the text box to shorten the list."
+                        )
+                        opt_slice = narrowed[:_MAX_SUPPLIER_MULTISELECT]
+                    else:
+                        opt_slice = narrowed
+                    selected_suppliers = st.multiselect(
+                        "Supplier list",
+                        options=opt_slice,
+                        default=[],
+                        help="Optional extra filter: if you select any names here, rows must match the text box (if any) AND be one of the selected names.",
+                        key="erp_filter_supplier",
+                    )
+                    st.caption(f"{len(supplier_all):,} distinct suppliers detected (excluding blank/Unknown).")
+                else:
+                    st.caption("No supplier names detected.")
+            else:
+                st.caption("No supplier column found in uploaded data.")
+
+        # -------- Month --------
+        with st.expander("Month", expanded=False):
+            month_options = (
+                _safe_sort_filter_options([m for m in all_tx["Month"].dropna().unique().tolist() if m != "N/A"])
+                if "Month" in all_tx.columns
+                else []
+            )
+            selected_months = st.multiselect(
+                "Month",
+                options=month_options,
+                default=[],
+                key="erp_filter_month",
+                label_visibility="collapsed",
+            )
+
+        # -------- Extra dimensions --------
+        extra_filters: dict[str, list[Any]] = {}
+        extra_contains: dict[str, str] = {}
+        with st.expander("GL / Cost Center / Category", expanded=False):
+            for col in [c for c in [C_GL_ACCOUNT, C_COST_CENTER, C_CATEGORY] if c in all_tx.columns]:
+                vals = all_tx[col].dropna()
+                vals = vals[vals.astype(str).str.strip() != ""]
+                uv = _safe_sort_filter_options(vals.unique().tolist())
+                nuniq = len(uv)
+                if nuniq < 2:
+                    continue
+                key_ms = f"erp_ms_{col}"
+                key_co = f"erp_co_{col}"
+                if nuniq <= 100:
+                    sel = st.multiselect(col, options=uv, default=[], key=key_ms)
+                    if sel:
+                        extra_filters[col] = sel
+                else:
+                    qcol = st.text_input(f"{col} contains", value="", key=key_co)
+                    qcols = qcol.strip().casefold()
+                    narrowed_uv = [u for u in uv if not qcols or qcols in str(u).casefold()][:_MAX_SUPPLIER_MULTISELECT]
+                    sel = st.multiselect(col, options=narrowed_uv, default=[], key=key_ms)
+                    if sel:
+                        extra_filters[col] = sel
+                    elif qcol.strip():
+                        extra_contains[col] = qcol.strip()
+                    st.caption(f"{col}: {nuniq:,} values")
+
+        # Active filters summary (high signal; helps avoid confusion).
+        active_bits: list[str] = []
+        if selected_companies:
+            active_bits.append(f"Company/File: {len(selected_companies)}")
+        if supplier_q.strip():
+            active_bits.append("Supplier contains")
+        if selected_suppliers:
+            active_bits.append(f"Supplier picked: {len(selected_suppliers)}")
+        if selected_months:
+            active_bits.append(f"Months: {len(selected_months)}")
+        if extra_filters:
+            active_bits.append("Extra: pick")
+        if extra_contains:
+            active_bits.append("Extra: contains")
+        if active_bits:
+            st.markdown("---")
+            st.caption("Active filters: " + " · ".join(active_bits))
 
     view = all_tx.copy()
-    if selected_companies:
-        view = view[view[C_SOURCE].isin(selected_companies)]
-    if selected_suppliers:
-        view = view[view[C_SUPPLIER_NAME].isin(selected_suppliers)]
-    if selected_months:
+    if selected_companies and C_SOURCE in view.columns:
+        lab = view[C_SOURCE].map(_filter_label)
+        view = view[lab.isin(set(selected_companies))]
+    if C_SUPPLIER_NAME in view.columns:
+        if supplier_q.strip():
+            view = view[_contains_substr_ci(view[C_SUPPLIER_NAME], supplier_q.strip())]
+        if selected_suppliers:
+            view = view[view[C_SUPPLIER_NAME].isin(selected_suppliers)]
+    if selected_months and "Month" in view.columns:
         view = view[view["Month"].isin(selected_months)]
     for col, vals in extra_filters.items():
-        view = view[view[col].isin(vals)]
+        if not vals or col not in view.columns:
+            continue
+        want = {_filter_label(v) for v in vals if _filter_label(v)}
+        if not want:
+            continue
+        lab = view[col].map(_filter_label)
+        view = view[lab.isin(want)]
+    for col, needle in extra_contains.items():
+        if col in view.columns and needle.strip():
+            view = view[_contains_substr_ci(view[col], needle)]
 
     # Ensure numeric columns are properly typed
     if C_DEBIT in view.columns:
@@ -2755,188 +2919,355 @@ def main() -> None:
     total_net = view[C_AMOUNT].sum() if C_AMOUNT in view.columns else 0
     n_suppliers = view[C_SUPPLIER_NAME].nunique() if C_SUPPLIER_NAME in view.columns else 0
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    try:
-        SafeAnalytics.safe_metric(k1, "Total Debit (Spend)", total_debit if total_debit and not pd.isna(total_debit) else 0)
-        k1.metric("Total Debit (Spend)", f"{EURO} {float(total_debit):,.2f}")
-    except Exception as e:
-        logger.error(f"Debit metric failed: {str(e)}")
-        k1.metric("Total Debit (Spend)", "ERROR")
+    tabs = st.tabs(["Overview", "Transactions", "Files"])
 
-    try:
-        k2.metric("Total Credit (Returns)", f"{EURO} {float(total_credit):,.2f}")
-    except Exception as e:
-        logger.error(f"Credit metric failed: {str(e)}")
-        k2.metric("Total Credit (Returns)", "ERROR")
+    with tabs[0]:
+        k1, k2, k3, k4, k5 = st.columns(5)
+        try:
+            SafeAnalytics.safe_metric(k1, "Total Debit (Spend)", total_debit if total_debit and not pd.isna(total_debit) else 0)
+            k1.metric("Total Debit (Spend)", f"{EURO} {float(total_debit):,.2f}")
+        except Exception as e:
+            logger.error(f"Debit metric failed: {str(e)}")
+            k1.metric("Total Debit (Spend)", "ERROR")
 
-    try:
-        k3.metric("Net Amount", f"{EURO} {float(total_net):,.2f}")
-    except Exception as e:
-        logger.error(f"Net metric failed: {str(e)}")
-        k3.metric("Net Amount", "ERROR")
+        try:
+            k2.metric("Total Credit (Returns)", f"{EURO} {float(total_credit):,.2f}")
+        except Exception as e:
+            logger.error(f"Credit metric failed: {str(e)}")
+            k2.metric("Total Credit (Returns)", "ERROR")
 
-    try:
-        k4.metric("Unique Suppliers", f"{int(n_suppliers):,}")
-    except Exception as e:
-        logger.error(f"Suppliers metric failed: {str(e)}")
-        k4.metric("Unique Suppliers", "ERROR")
+        try:
+            k3.metric("Net Amount", f"{EURO} {float(total_net):,.2f}")
+        except Exception as e:
+            logger.error(f"Net metric failed: {str(e)}")
+            k3.metric("Net Amount", "ERROR")
 
-    try:
-        k5.metric("Files / Records", f"{len(uploaded_files)} / {len(view):,}")
-    except Exception as e:
-        logger.error(f"Files/Records metric failed: {str(e)}")
-        k5.metric("Files / Records", "ERROR")
+        try:
+            k4.metric("Unique Suppliers", f"{int(n_suppliers):,}")
+        except Exception as e:
+            logger.error(f"Suppliers metric failed: {str(e)}")
+            k4.metric("Unique Suppliers", "ERROR")
 
-    st.markdown("---")
+        try:
+            k5.metric("Files / Records", f"{len(uploaded_files)} / {len(view):,}")
+        except Exception as e:
+            logger.error(f"Files/Records metric failed: {str(e)}")
+            k5.metric("Files / Records", "ERROR")
 
-    agg_view = _aggregate_by_supplier(view)
-    st.subheader("Supplier summary — one row per supplier")
-    st.caption(
-        f"Names that are **≥{int(display_threshold * 100)}%** similar (fuzzy match) are treated as one supplier; "
-        "**Debit**, **Credit**, and **Amount** are **added** across all matching rows. "
-        "Transaction count, months, and sources are combined. Detail lines stay in 'All Individual Transactions'."
-    )
-    st.dataframe(agg_view, use_container_width=True, height=420, hide_index=True)
-    st.markdown("---")
-
-    col_left, col_right = st.columns(2)
-    spend_view = view[view[C_DEBIT] > 0] if C_DEBIT in view.columns else view
-
-    with col_left:
-        st.subheader("Top 20 Suppliers by Spend")
-        if C_SUPPLIER_NAME in spend_view.columns and C_DEBIT in spend_view.columns and not spend_view.empty:
-            # Ensure numeric debit column
-            temp_spend = spend_view.copy()
-            temp_spend[C_DEBIT] = pd.to_numeric(temp_spend[C_DEBIT], errors="coerce").fillna(0)
-            top_sup = temp_spend[temp_spend[C_DEBIT] > 0].groupby(C_SUPPLIER_NAME, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False).head(20)
-            if not top_sup.empty:
-                fig = px.bar(top_sup, x=C_SUPPLIER_NAME, y=C_DEBIT, color=C_DEBIT,
-                             color_continuous_scale="Blues", labels={C_DEBIT: f"Spend ({EURO})", C_SUPPLIER_NAME: "Supplier"})
-                fig.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No spend data (all debit amounts are zero or negative).")
-        else:
-            st.info("No spend data available.")
-
-    with col_right:
-        st.subheader("Monthly Spend Trend")
-        vm = spend_view[spend_view["Month"] != "N/A"] if "Month" in spend_view.columns else pd.DataFrame()
-        if not vm.empty and C_DEBIT in vm.columns:
-            temp_monthly = vm.copy()
-            temp_monthly[C_DEBIT] = pd.to_numeric(temp_monthly[C_DEBIT], errors="coerce").fillna(0)
-            monthly = temp_monthly.groupby("Month", as_index=False)[C_DEBIT].sum().sort_values("Month")
-            if not monthly.empty:
-                fig = px.line(monthly, x="Month", y=C_DEBIT, markers=True,
-                              labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month"})
-                fig.update_layout(xaxis_tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No monthly data available.")
-        else:
-            st.info("Date information not available for monthly chart.")
-
-    st.markdown("---")
-
-    if C_SOURCE in view.columns and view[C_SOURCE].nunique() > 1:
-        st.subheader("Spend by Company / File")
-        c1, c2 = st.columns(2)
-        by_company = view.groupby(C_SOURCE, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False)
-        with c1:
-            fig = px.bar(by_company, x=C_SOURCE, y=C_DEBIT, color=C_DEBIT,
-                         color_continuous_scale="Greens", labels={C_DEBIT: f"Spend ({EURO})", C_SOURCE: "Company"})
-            fig.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
-        with c2:
-            fig = px.pie(by_company, names=C_SOURCE, values=C_DEBIT, labels={C_DEBIT: f"Spend ({EURO})", C_SOURCE: "Company"})
-            fig.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig, use_container_width=True)
         st.markdown("---")
 
-    if C_SOURCE in view.columns and view[C_SOURCE].nunique() > 1 and "Month" in view.columns:
-        vm2 = view[view["Month"] != "N/A"]
-        if not vm2.empty:
-            st.subheader("Monthly Spend by Company")
-            mc = vm2.groupby([C_SOURCE, "Month"], as_index=False)[C_DEBIT].sum().sort_values("Month")
-            fig = px.line(mc, x="Month", y=C_DEBIT, color=C_SOURCE, markers=True,
-                          labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month", C_SOURCE: "Company"})
-            fig.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown("---")
+        agg_view = _aggregate_by_supplier(view)
+        st.subheader("Supplier summary — one row per supplier")
+        st.caption(
+            f"Names that are **≥{int(display_threshold * 100)}%** similar (fuzzy match) are treated as one supplier; "
+            "**Debit**, **Credit**, and **Amount** are **added** across all matching rows. "
+            "Transaction count, months, and sources are combined. Detail lines stay in the Transactions tab."
+        )
+        st.dataframe(agg_view, use_container_width=True, height=440, hide_index=True)
+        st.markdown("---")
 
-    breakdown_cols = [c for c in [C_GL_ACCOUNT, C_COST_CENTER, C_CATEGORY]
-                      if c in view.columns and view[c].astype(str).str.strip().replace("", pd.NA).dropna().nunique() >= 2]
-    if breakdown_cols:
-        st.subheader("Spend Breakdown")
-        tabs = st.tabs(breakdown_cols)
-        for tab, col in zip(tabs, breakdown_cols):
-            with tab:
-                bd = view[view[col].astype(str).str.strip() != ""].groupby(col, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False).head(25)
-                if not bd.empty:
-                    bc1, bc2 = st.columns(2)
-                    with bc1:
-                        fig = px.bar(bd, x=col, y=C_DEBIT, color=C_DEBIT, color_continuous_scale="Oranges", labels={C_DEBIT: f"Spend ({EURO})"})
-                        fig.update_layout(xaxis_tickangle=-45, showlegend=False, coloraxis_showscale=False)
-                        st.plotly_chart(fig, use_container_width=True)
-                    with bc2:
-                        fig = px.pie(bd.head(10), names=col, values=C_DEBIT)
-                        fig.update_traces(textposition="inside", textinfo="percent+label")
-                        st.plotly_chart(fig, use_container_width=True)
+        col_left, col_right = st.columns(2)
+        spend_view = view[view[C_DEBIT] > 0] if C_DEBIT in view.columns else view
+
+        with col_left:
+            st.subheader("Top 20 Suppliers by Spend")
+            if C_SUPPLIER_NAME in spend_view.columns and C_DEBIT in spend_view.columns and not spend_view.empty:
+                temp_spend = spend_view.copy()
+                temp_spend[C_DEBIT] = pd.to_numeric(temp_spend[C_DEBIT], errors="coerce").fillna(0)
+                top_sup = (
+                    temp_spend[temp_spend[C_DEBIT] > 0]
+                    .groupby(C_SUPPLIER_NAME, as_index=False)[C_DEBIT]
+                    .sum()
+                    .sort_values(C_DEBIT, ascending=False)
+                    .head(20)
+                )
+                if not top_sup.empty:
+                    fig = px.bar(
+                        top_sup,
+                        x=C_SUPPLIER_NAME,
+                        y=C_DEBIT,
+                        color=C_DEBIT,
+                        color_continuous_scale="Teal",
+                        labels={C_DEBIT: f"Spend ({EURO})", C_SUPPLIER_NAME: "Supplier"},
+                    )
+                    fig.update_layout(
+                        template=_CHART_TEMPLATE,
+                        paper_bgcolor=_CHART_PAPER,
+                        plot_bgcolor=_CHART_PLOT,
+                        xaxis_tickangle=-45,
+                        showlegend=False,
+                        coloraxis_showscale=False,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info(f"No data for {col}.")
+                    st.info("No spend data (all debit amounts are zero or negative).")
+            else:
+                st.info("No spend data available.")
+
+        with col_right:
+            st.subheader("Monthly Spend Trend")
+            vm = spend_view[spend_view["Month"] != "N/A"] if "Month" in spend_view.columns else pd.DataFrame()
+            if not vm.empty and C_DEBIT in vm.columns:
+                temp_monthly = vm.copy()
+                temp_monthly[C_DEBIT] = pd.to_numeric(temp_monthly[C_DEBIT], errors="coerce").fillna(0)
+                monthly = temp_monthly.groupby("Month", as_index=False)[C_DEBIT].sum().sort_values("Month")
+                if not monthly.empty:
+                    fig = px.line(
+                        monthly,
+                        x="Month",
+                        y=C_DEBIT,
+                        markers=True,
+                        labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month"},
+                        color_discrete_sequence=[_THEME_PRIMARY],
+                    )
+                    fig.update_layout(
+                        template=_CHART_TEMPLATE,
+                        paper_bgcolor=_CHART_PAPER,
+                        plot_bgcolor=_CHART_PLOT,
+                        xaxis_tickangle=-45,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No monthly data available.")
+            else:
+                st.info("Date information not available for monthly chart.")
+
         st.markdown("---")
 
-    if C_SUPPLIER_NAME in view.columns and not view.empty:
-        st.subheader("Supplier Debit vs Credit")
-        sc = view.groupby(C_SUPPLIER_NAME, as_index=False).agg({C_DEBIT: "sum", C_CREDIT: "sum"})
-        sc = sc[(sc[C_DEBIT] > 0) | (sc[C_CREDIT] > 0)]
-        if not sc.empty and len(sc) > 1:
-            sc["_size"] = (sc[C_DEBIT].abs() + sc[C_CREDIT].abs()).clip(lower=1)
-            fig = px.scatter(sc, x=C_DEBIT, y=C_CREDIT, hover_name=C_SUPPLIER_NAME,
-                             size="_size",
-                             labels={C_DEBIT: f"Total Debit ({EURO})", C_CREDIT: f"Total Credit ({EURO})"}, size_max=40)
-            st.plotly_chart(fig, use_container_width=True)
+        if C_SOURCE in view.columns and view[C_SOURCE].nunique() > 1:
+            st.subheader("Spend by Company / File")
+            c1, c2 = st.columns(2)
+            by_company = view.groupby(C_SOURCE, as_index=False)[C_DEBIT].sum().sort_values(C_DEBIT, ascending=False)
+            with c1:
+                fig = px.bar(
+                    by_company,
+                    x=C_SOURCE,
+                    y=C_DEBIT,
+                    color=C_DEBIT,
+                    color_continuous_scale="Purp",
+                    labels={C_DEBIT: f"Spend ({EURO})", C_SOURCE: "Company"},
+                )
+                fig.update_layout(
+                    template=_CHART_TEMPLATE,
+                    paper_bgcolor=_CHART_PAPER,
+                    plot_bgcolor=_CHART_PLOT,
+                    xaxis_tickangle=-45,
+                    showlegend=False,
+                    coloraxis_showscale=False,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = px.pie(
+                    by_company,
+                    names=C_SOURCE,
+                    values=C_DEBIT,
+                    labels={C_DEBIT: f"Spend ({EURO})", C_SOURCE: "Company"},
+                    color_discrete_sequence=px.colors.sequential.Teal,
+                )
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                fig.update_layout(template=_CHART_TEMPLATE, paper_bgcolor=_CHART_PAPER)
+                st.plotly_chart(fig, use_container_width=True)
             st.markdown("---")
 
-    if C_AMOUNT in view.columns and len(view) > 10:
-        st.subheader("Transaction Amount Distribution")
-        amounts = view[C_AMOUNT][view[C_AMOUNT] != 0]
-        if len(amounts) > 5:
-            fig = px.histogram(amounts, nbins=50, labels={"value": f"Amount ({EURO})", "count": "Frequency"},
-                               color_discrete_sequence=["#636EFA"])
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+        if C_SOURCE in view.columns and view[C_SOURCE].nunique() > 1 and "Month" in view.columns:
+            vm2 = view[view["Month"] != "N/A"]
+            if not vm2.empty:
+                st.subheader("Monthly Spend by Company")
+                mc = vm2.groupby([C_SOURCE, "Month"], as_index=False)[C_DEBIT].sum().sort_values("Month")
+                fig = px.line(
+                    mc,
+                    x="Month",
+                    y=C_DEBIT,
+                    color=C_SOURCE,
+                    markers=True,
+                    labels={C_DEBIT: f"Spend ({EURO})", "Month": "Month", C_SOURCE: "Company"},
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                fig.update_layout(
+                    template=_CHART_TEMPLATE,
+                    paper_bgcolor=_CHART_PAPER,
+                    plot_bgcolor=_CHART_PLOT,
+                    xaxis_tickangle=-45,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
+
+        breakdown_cols = [
+            c
+            for c in [C_GL_ACCOUNT, C_COST_CENTER, C_CATEGORY]
+            if c in view.columns and view[c].astype(str).str.strip().replace("", pd.NA).dropna().nunique() >= 2
+        ]
+        if breakdown_cols:
+            st.subheader("Spend Breakdown")
+            btabs = st.tabs(breakdown_cols)
+            for tab, col in zip(btabs, breakdown_cols):
+                with tab:
+                    bd = (
+                        view[view[col].astype(str).str.strip() != ""]
+                        .groupby(col, as_index=False)[C_DEBIT]
+                        .sum()
+                        .sort_values(C_DEBIT, ascending=False)
+                        .head(25)
+                    )
+                    if not bd.empty:
+                        bc1, bc2 = st.columns(2)
+                        with bc1:
+                            fig = px.bar(
+                                bd,
+                                x=col,
+                                y=C_DEBIT,
+                                color=C_DEBIT,
+                                color_continuous_scale="Sunset",
+                                labels={C_DEBIT: f"Spend ({EURO})"},
+                            )
+                            fig.update_layout(
+                                template=_CHART_TEMPLATE,
+                                paper_bgcolor=_CHART_PAPER,
+                                plot_bgcolor=_CHART_PLOT,
+                                xaxis_tickangle=-45,
+                                showlegend=False,
+                                coloraxis_showscale=False,
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        with bc2:
+                            fig = px.pie(
+                                bd.head(10),
+                                names=col,
+                                values=C_DEBIT,
+                                color_discrete_sequence=px.colors.sequential.Sunset,
+                            )
+                            fig.update_traces(textposition="inside", textinfo="percent+label")
+                            fig.update_layout(template=_CHART_TEMPLATE, paper_bgcolor=_CHART_PAPER)
+                            st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info(f"No data for {col}.")
             st.markdown("---")
 
-    vm3 = view[view["Month"] != "N/A"] if "Month" in view.columns else pd.DataFrame()
-    if not vm3.empty and C_SUPPLIER_NAME in vm3.columns and vm3["Month"].nunique() >= 2:
-        st.subheader("Top 15 Suppliers -- Monthly Heatmap")
-        top15 = vm3.groupby(C_SUPPLIER_NAME)[C_DEBIT].sum().nlargest(15).index.tolist()
-        hm = vm3[vm3[C_SUPPLIER_NAME].isin(top15)].groupby([C_SUPPLIER_NAME, "Month"])[C_DEBIT].sum().unstack(fill_value=0)
-        if not hm.empty:
-            fig = px.imshow(hm, labels=dict(x="Month", y="Supplier", color=f"Spend ({EURO})"),
-                            color_continuous_scale="YlOrRd", aspect="auto")
-            fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown("---")
+        if C_SUPPLIER_NAME in view.columns and not view.empty:
+            st.subheader("Supplier Debit vs Credit")
+            sc = view.groupby(C_SUPPLIER_NAME, as_index=False).agg({C_DEBIT: "sum", C_CREDIT: "sum"})
+            sc = sc[(sc[C_DEBIT] > 0) | (sc[C_CREDIT] > 0)]
+            if not sc.empty and len(sc) > 1:
+                sc["_size"] = (sc[C_DEBIT].abs() + sc[C_CREDIT].abs()).clip(lower=1)
+                fig = px.scatter(
+                    sc,
+                    x=C_DEBIT,
+                    y=C_CREDIT,
+                    hover_name=C_SUPPLIER_NAME,
+                    size="_size",
+                    labels={C_DEBIT: f"Total Debit ({EURO})", C_CREDIT: f"Total Credit ({EURO})"},
+                    size_max=40,
+                )
+                fig.update_traces(
+                    marker=dict(color=_THEME_PRIMARY, opacity=0.78, line=dict(width=0.5, color=_THEME_SECONDARY))
+                )
+                fig.update_layout(
+                    template=_CHART_TEMPLATE,
+                    paper_bgcolor=_CHART_PAPER,
+                    plot_bgcolor=_CHART_PLOT,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
 
-    with st.expander("All Individual Transactions", expanded=False):
-        st.dataframe(view, use_container_width=True, height=400, hide_index=True)
+        if C_AMOUNT in view.columns and len(view) > 10:
+            st.subheader("Transaction Amount Distribution")
+            amounts = view[C_AMOUNT][view[C_AMOUNT] != 0]
+            if len(amounts) > 5:
+                fig = px.histogram(
+                    amounts,
+                    nbins=50,
+                    labels={"value": f"Amount ({EURO})", "count": "Frequency"},
+                    color_discrete_sequence=[_THEME_WARM],
+                )
+                fig.update_layout(
+                    template=_CHART_TEMPLATE,
+                    paper_bgcolor=_CHART_PAPER,
+                    plot_bgcolor=_CHART_PLOT,
+                    showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button("Download Supplier Summary (Excel)", data=to_excel_bytes(agg_view),
-                           file_name="supplier_summary.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with c2:
-        st.download_button("Download All Transactions (Excel)", data=to_excel_bytes(view),
-                           file_name="cleaned_procurement_data.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with c3:
-        if not all_suppliers.empty:
-            st.download_button("Download Suppliers (Excel)", data=to_excel_bytes(all_suppliers),
-                               file_name="cleaned_suppliers.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        vm3 = view[view["Month"] != "N/A"] if "Month" in view.columns else pd.DataFrame()
+        if not vm3.empty and C_SUPPLIER_NAME in vm3.columns and vm3["Month"].nunique() >= 2:
+            st.subheader("Top 15 Suppliers — Monthly Heatmap")
+            top15 = vm3.groupby(C_SUPPLIER_NAME)[C_DEBIT].sum().nlargest(15).index.tolist()
+            hm = (
+                vm3[vm3[C_SUPPLIER_NAME].isin(top15)]
+                .groupby([C_SUPPLIER_NAME, "Month"])[C_DEBIT]
+                .sum()
+                .unstack(fill_value=0)
+            )
+            if not hm.empty:
+                fig = px.imshow(
+                    hm,
+                    labels=dict(x="Month", y="Supplier", color=f"Spend ({EURO})"),
+                    color_continuous_scale="Turbo",
+                    aspect="auto",
+                )
+                fig.update_layout(template=_CHART_TEMPLATE, paper_bgcolor=_CHART_PAPER, height=520)
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tabs[1]:
+        st.subheader("All Individual Transactions")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            tx_rows = st.slider(
+                "Rows to display",
+                min_value=50,
+                max_value=5_000,
+                value=400,
+                step=50,
+                help="Showing fewer rows keeps the UI snappy on large files.",
+                key="erp_tx_rows",
+            )
+        with c2:
+            show_cols = st.multiselect(
+                "Columns",
+                options=view.columns.tolist(),
+                default=view.columns.tolist()[: min(12, len(view.columns))],
+                help="Pick columns to display (download always includes all columns).",
+                key="erp_tx_cols",
+            )
+        tx_view = view[show_cols].head(int(tx_rows)) if show_cols else view.head(int(tx_rows))
+        st.dataframe(tx_view, use_container_width=True, height=520, hide_index=True)
+        st.markdown("---")
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.download_button(
+                "Download Supplier Summary (Excel)",
+                data=to_excel_bytes(_aggregate_by_supplier(view)),
+                file_name="supplier_summary.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with d2:
+            st.download_button(
+                "Download All Transactions (Excel)",
+                data=to_excel_bytes(view),
+                file_name="cleaned_procurement_data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with d3:
+            if not all_suppliers.empty:
+                st.download_button(
+                    "Download Suppliers (Excel)",
+                    data=to_excel_bytes(all_suppliers),
+                    file_name="cleaned_suppliers.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+    with tabs[2]:
+        st.subheader("Uploaded Files Overview")
+        for r in results:
+            st.markdown(f"**{r['filename']}** — Company: *{r['company']}*")
+            if r.get("sheet_info"):
+                st.dataframe(pd.DataFrame(r["sheet_info"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No sheet metadata recorded.")
 
 
 if __name__ == "__main__":
